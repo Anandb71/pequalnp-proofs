@@ -1872,17 +1872,23 @@ theorem moved_faithful {r s a b} (ha : faithful r s a) (hb : faithful r s b) (op
   · exact faithful_bin _ ha hb
 
 abbrev NodeContext := Nat × Nat × List Decor × CovPair × List BoundPool × (Nat → List (List Sig))
+def finishMove (c : NodeContext) (op : Nat) (a b z : Decor) (ka kb : Bool) :=
+  let (cap,_,ws,_,pools,links) := c
+  if !properB z.1 || ws.any (fun v => v.1==z.1) then true else
+    let rest := (opKeep (op==2) ka kb a b ws).map Prod.fst
+    closeChild pools links (cap-1) rest (movedChoice op a b)
+
 def evalMove (c : NodeContext) (op : Nat) (a b z : Decor) (ka kb : Bool) :=
-  let (cap,n,ws,cov,pools,links) := c
+  let cap := c.1
+  let n := c.2.1
+  let cov := c.2.2.2.1
   let un := op==2
   let len := 1+(n - (if ka then 0 else 1) - (if un || kb then 0 else 1))
   if len>cap then true else
     let d := len==cap
     let rs := restCov (getCov cov d) (column d a.2) (column d b.2) un ka kb
     if (rs ||| column d z.2) != BitVec.allOnes 768 then true else
-    if !properB z.1 || ws.any (fun v => v.1==z.1) then true else
-      let rest := (opKeep un ka kb a b ws).map Prod.fst
-      closeChild pools links (cap-1) rest (movedChoice op a b)
+      finishMove c op a b z ka kb
 
 def moveFront (ws : List Decor) (op : Nat) (a b : Decor) (ka kb : Bool) :=
   (movedDecor op a b).1 :: (opKeep (op==2) ka kb a b ws).map Prod.fst
@@ -2735,13 +2741,17 @@ theorem quickAt_good {c i j op ka kb} (hi : i<c.2.2.1.length) (hj : j<c.2.2.1.le
       ((opKeep (op==2) ka kb (contextWire c i) (contextWire c j) c.2.2.1).map Prod.fst)
       (movedChoice op (contextWire c i) (contextWire c j)))=true :=
     List.any_eq_true.mpr ⟨p,hp,closed⟩
-  simp only [checkAt,evalMove,closeChild,cut,Bool.or_true]
+  simp only [checkAt,evalMove,finishMove,closeChild,cut,Bool.or_true]
   repeat' split
   all_goals rfl
 
+-- A marked lane has already passed the packed coverage test.
 def fallbackAt (c : NodeContext) (i j op : Nat) (ka kb : Bool) :=
+  let a := contextWire c i
+  let b := contextWire c j
   (if i<c.2.2.1.length ∧ j<c.2.2.1.length then quickAt c i j op ka kb else false) ||
-    checkAt c i j op ka kb
+    finishMove c op a b (movedDecor op a b) ka kb
+
 theorem fallback_sound {c i j op ka kb} (h : fallbackAt c i j op ka kb=true) :
     checkAt c i j op ka kb=true := by
   simp only [fallbackAt,Bool.or_eq_true] at h
@@ -2749,7 +2759,8 @@ theorem fallback_sound {c i j op ka kb} (h : fallbackAt c i j op ka kb=true) :
   · split at h
     next yes => exact quickAt_good yes.1 yes.2 h
     next => contradiction
-  · exact h
+  · simp only [checkAt,evalMove,h,ite_self]
+
 def batchMove (b : Batch) (xs : List NodeContext) (i j op : Nat) (ka kb : Bool) :=
   let (k,n,r,_,u,v) := b
   let un := op==2
@@ -2772,11 +2783,8 @@ theorem batchMove_at (k n) (xs : List NodeContext) {i j op : Nat} {ka kb}
   let d := len==k
   have eval : checkAt xs[q] i j op ka kb =
       if len>k then true else if combField xs[q] d (op==2) ka kb op i j != BitVec.allOnes 768 then true
-      else if !properB (movedDecor op (contextWire xs[q] i) (contextWire xs[q] j)).1 ||
-        xs[q].2.2.1.any (fun v => v.1==(movedDecor op (contextWire xs[q] i) (contextWire xs[q] j)).1)
-      then true else closeChild xs[q].2.2.2.2.1 xs[q].2.2.2.2.2 (k-1)
-        ((opKeep (op==2) ka kb (contextWire xs[q] i) (contextWire xs[q] j) xs[q].2.2.1).map Prod.fst)
-        (movedChoice op (contextWire xs[q] i) (contextWire xs[q] j)) := by
+      else finishMove xs[q] op (contextWire xs[q] i) (contextWire xs[q] j)
+        (movedDecor op (contextWire xs[q] i) (contextWire xs[q] j)) ka kb := by
     simp only [checkAt,evalMove,budget,arity,len,d,combField] <;> rfl
   by_cases small : len>k
   · simp [eval,small]
@@ -2804,9 +2812,43 @@ theorem batchMove_at (k n) (xs : List NodeContext) {i j op : Nat} {ka kb}
     · rw [eval,if_neg small,if_pos (bne_iff_ne.mpr hit)]
 
 
+-- If one wire is kept, at least the original number of wires remains.
+-- If both are kept, the new wire increases that number by one.
 def batchPair (b : Batch) (xs : List NodeContext) (i j op : Nat) :=
   let f := batchMove b xs i j op
-  f false false && f true false && f false true && f true true
+  f false false &&
+    (if b.2.1 ≤ b.1 then f true false && f false true else true) &&
+    (if b.2.1 < b.1 then f true true else true)
+
+theorem batchPair_checks (b : Batch) (xs : List NodeContext) (i j op : Nat)
+    (binary : (op==2) = false) :
+    batchPair b xs i j op =
+      (batchMove b xs i j op false false && batchMove b xs i j op true false &&
+        batchMove b xs i j op false true && batchMove b xs i j op true true) := by
+  rcases b with ⟨k,n,r,ws,u,v⟩
+  let b : Batch := (k,n,r,ws,u,v)
+  have dropLeft (h : k < n) : batchMove b xs i j op false true = true := by
+    simp only [batchMove,b,binary,Bool.false_or,Bool.false_eq_true,ite_true,ite_false,Nat.sub_zero]
+    exact if_pos (by omega)
+  have dropRight (h : k < n) : batchMove b xs i j op true false = true := by
+    simp only [batchMove,b,binary,Bool.false_or,Bool.false_eq_true,ite_true,ite_false,Nat.sub_zero]
+    exact if_pos (by omega)
+  have keepBoth (h : k ≤ n) : batchMove b xs i j op true true = true := by
+    simp only [batchMove,b,binary,Bool.false_or,ite_true,Nat.sub_zero]
+    exact if_pos (by omega)
+  change batchPair b xs i j op =
+    (batchMove b xs i j op false false && batchMove b xs i j op true false &&
+      batchMove b xs i j op false true && batchMove b xs i j op true true)
+  by_cases mixed : n ≤ k
+  · by_cases both : n < k
+    · simp only [batchPair,show b.2.1 = n from rfl,show b.1 = k from rfl,
+        mixed,both,ite_true,Bool.and_assoc]
+    · simp only [batchPair,show b.2.1 = n from rfl,show b.1 = k from rfl,
+        mixed,both,ite_true,ite_false,keepBoth (by omega),Bool.and_true,Bool.and_assoc]
+  · simp only [batchPair,show b.2.1 = n from rfl,show b.1 = k from rfl,
+      mixed,show ¬ n < k by omega,ite_false,dropLeft (by omega),dropRight (by omega),
+      keepBoth (by omega),Bool.and_true]
+
 def batchRow (b : Batch) (xs : List NodeContext) (i : Nat) (js : List Nat) :=
   batchMove b xs i i 2 false false && batchMove b xs i i 2 true true &&
     js.all (fun j => batchPair b xs i j 0 && batchPair b xs i j 1)
@@ -2832,7 +2874,9 @@ theorem batchRows_at (k n) (xs : List NodeContext) {q : Nat} (hq : q<xs.length)
     have both := allRows.1.2 j hj
     have opCheck (d : Bool) (pass : batchPair (makeBatch k n xs) xs i j (if d then 1 else 0)=true) :
         testPair xs[q] (contextWire xs[q] i) (contextWire xs[q] j) d=true := by
-      simp only [batchPair,Bool.and_eq_true] at pass
+      have binary : ((if d then 1 else 0 : Nat)==2) = false := by cases d <;> rfl
+      rw [batchPair_checks _ _ _ _ _ binary] at pass
+      simp only [Bool.and_eq_true] at pass
       simp only [testPair,Bool.and_eq_true]
       exact ⟨⟨⟨check hi hj' hq budget arity pass.1.1.1,check hi hj' hq budget arity pass.1.1.2⟩,
         check hi hj' hq budget arity pass.1.2⟩,check hi hj' hq budget arity pass.2⟩
